@@ -1,0 +1,43 @@
+{
+  "name": "smoked",
+  "version": "0.1.0",
+  "description": "See how many tokens your AI coding session is burning",
+  "type": "commonjs",
+  "bin": {
+    "smoked": "./bin/smoked"
+  },
+  "scripts": {
+    "prepublishOnly": "node -c bin/smoked"
+  },
+  "files": [
+    "bin",
+    "commands",
+    "skills",
+    ".claude-plugin",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "tokens",
+    "usage",
+    "cost",
+    "anthropic",
+    "cli",
+    "plugin"
+  ],
+  "author": "Thomas Eyaa",
+  "license": "MIT",
+  "homepage": "https://github.com/thomaseyaa/smoked#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thomaseyaa/smoked.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thomaseyaa/smoked/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

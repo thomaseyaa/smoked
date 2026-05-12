@@ -1,0 +1,11 @@
+{
+  "name": "smoked",
+  "description": "See how many tokens your AI coding session is burning",
+  "version": "0.1.0",
+  "author": {
+    "name": "Thomas Eyaa"
+  },
+  "homepage": "https://github.com/thomaseyaa/smoked",
+  "repository": "https://github.com/thomaseyaa/smoked",
+  "license": "MIT"
+}

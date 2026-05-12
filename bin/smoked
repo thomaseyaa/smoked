@@ -1,0 +1,348 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const CLAUDE_DIR = path.join(os.homedir(), '.claude');
+const SESSIONS_DIR = path.join(CLAUDE_DIR, 'sessions');
+const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
+
+// Strip ANSI escapes when stdout is piped, redirected, or NO_COLOR is set
+// (https://no-color.org) so `smoked > out.txt` produces clean text.
+const COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
+if (!COLOR) {
+  const stripAnsi = (s) => typeof s === 'string' ? s.replace(/\x1b\[[0-9;]*m/g, '') : s;
+  const _log = console.log.bind(console);
+  const _err = console.error.bind(console);
+  console.log = (...args) => _log(...args.map(stripAnsi));
+  console.error = (...args) => _err(...args.map(stripAnsi));
+}
+
+// Model pricing per million tokens (USD).
+// `cache_create` is the 5-minute cache write rate.
+// Source: https://platform.claude.com/docs/en/about-claude/pricing (verified 2026-05-12)
+const PRICING = {
+  'claude-opus-4-7':   { input: 5,  output: 25, cache_create: 6.25, cache_read: 0.5 },
+  'claude-opus-4-6':   { input: 5,  output: 25, cache_create: 6.25, cache_read: 0.5 },
+  'claude-sonnet-4-6': { input: 3,  output: 15, cache_create: 3.75, cache_read: 0.3 },
+  'claude-haiku-4-5':  { input: 1,  output: 5,  cache_create: 1.25, cache_read: 0.1 },
+};
+
+// Bare aliases Claude Code sometimes records (e.g. for subagents).
+const ALIASES = {
+  'opus': 'claude-opus-4-7',
+  'sonnet': 'claude-sonnet-4-6',
+  'haiku': 'claude-haiku-4-5',
+};
+
+// Non-billable placeholders that appear in usage records with zero tokens.
+const NON_BILLABLE = new Set(['<synthetic>']);
+
+// Model IDs sometimes carry a date suffix like `claude-haiku-4-5-20251001`.
+// Resolve aliases first, then try exact, then longest matching prefix
+// (requiring `-` after the key so `claude-opus-4-7` doesn't swallow a future `claude-opus-4-70`).
+function lookupPricing(model) {
+  if (ALIASES[model]) return PRICING[ALIASES[model]];
+  if (PRICING[model]) return PRICING[model];
+  const keys = Object.keys(PRICING).sort((a, b) => b.length - a.length);
+  for (const key of keys) {
+    if (model.startsWith(key + '-')) return PRICING[key];
+  }
+  return null;
+}
+
+// Pick the session most likely to be "the one the user is asking about":
+//   1. Sessions whose cwd matches where `smoked` was invoked from
+//   2. Sessions currently busy (Claude Code is processing a turn)
+//   3. Most recently active by updatedAt (fall back to startedAt)
+function findCurrentSession() {
+  if (!fs.existsSync(SESSIONS_DIR)) return null;
+
+  const all = fs.readdirSync(SESSIONS_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => {
+      try {
+        const data = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
+        return { file: f, ...data };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  if (all.length === 0) return null;
+
+  const recency = (s) => s.updatedAt || s.startedAt || 0;
+  const byRecency = (a, b) => recency(b) - recency(a);
+
+  const cwd = process.cwd();
+  const inCwd = all.filter(s => s.cwd === cwd).sort(byRecency);
+  if (inCwd.length > 0) {
+    const busyHere = inCwd.find(s => s.status === 'busy');
+    return busyHere || inCwd[0];
+  }
+
+  const busy = all.filter(s => s.status === 'busy').sort(byRecency);
+  if (busy.length > 0) return busy[0];
+
+  return all.sort(byRecency)[0];
+}
+
+function findSessionLog(sessionId) {
+  if (!fs.existsSync(PROJECTS_DIR)) return null;
+
+  const projects = fs.readdirSync(PROJECTS_DIR);
+  for (const project of projects) {
+    const logFile = path.join(PROJECTS_DIR, project, `${sessionId}.jsonl`);
+    if (fs.existsSync(logFile)) return logFile;
+  }
+  return null;
+}
+
+function parseTokens(logFile) {
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n');
+
+  const totals = {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_tokens: 0,
+    cache_read_tokens: 0,
+    turns: 0,
+    responses: 0,
+    cost_usd: 0,
+    by_model: {},
+    unknown_models: new Set(),
+  };
+
+  for (const line of lines) {
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+
+    // Count user turns
+    if (entry?.type === 'user' && entry?.message?.role === 'user') {
+      totals.turns++;
+    }
+
+    const usage = entry?.message?.usage;
+    const model = entry?.message?.model;
+    if (!usage || !model) continue;
+    if (NON_BILLABLE.has(model)) continue;
+
+    const input = usage.input_tokens || 0;
+    const output = usage.output_tokens || 0;
+    const cache_create = usage.cache_creation_input_tokens || 0;
+    const cache_read = usage.cache_read_input_tokens || 0;
+
+    totals.input_tokens += input;
+    totals.output_tokens += output;
+    totals.cache_creation_tokens += cache_create;
+    totals.cache_read_tokens += cache_read;
+    totals.responses++;
+
+    // Per-model tracking
+    if (!totals.by_model[model]) {
+      totals.by_model[model] = { input: 0, output: 0, cache_create: 0, cache_read: 0 };
+    }
+    totals.by_model[model].input += input;
+    totals.by_model[model].output += output;
+    totals.by_model[model].cache_create += cache_create;
+    totals.by_model[model].cache_read += cache_read;
+
+    // Calculate cost
+    const pricing = lookupPricing(model);
+    if (pricing) {
+      totals.cost_usd += (input / 1_000_000) * pricing.input;
+      totals.cost_usd += (output / 1_000_000) * pricing.output;
+      totals.cost_usd += (cache_create / 1_000_000) * pricing.cache_create;
+      totals.cost_usd += (cache_read / 1_000_000) * pricing.cache_read;
+    } else {
+      totals.unknown_models.add(model);
+    }
+  }
+
+  return totals;
+}
+
+function formatNumber(n) {
+  return n.toLocaleString('en-US');
+}
+
+function formatCost(n) {
+  return '$' + n.toFixed(2);
+}
+
+const TAGLINES = [
+  { max: 0.10,     line: '💨 barely lit' },
+  { max: 1,        line: '🔥 fresh pack vibes' },
+  { max: 5,        line: '🔥 a few drags in' },
+  { max: 15,       line: '🔥 burning steady' },
+  { max: 30,       line: '🔥 chain-smoking now' },
+  { max: 60,       line: '🔥 absolute heater' },
+  { max: 100,      line: '💸 lighting bills on fire' },
+  { max: Infinity, line: '🚒 someone call the fire dept' },
+];
+
+function getTagline(cost) {
+  for (const t of TAGLINES) {
+    if (cost < t.max) return t.line;
+  }
+  return TAGLINES[TAGLINES.length - 1].line;
+}
+
+// Render a cigarette where the ember (🔥) sits at the burn line:
+// filter on the left, ash to the right of it, then the ember, then the remaining paper.
+// At full burn the ember becomes smoke (💨) with no paper left.
+function renderBurnBar(cost) {
+  const BAR_LEN = 20;
+  const ratio = Math.min(1, Math.max(0, cost) / 30);
+  const burned = Math.round(ratio * BAR_LEN);
+  const remaining = BAR_LEN - burned;
+  const filter = '\x1b[33m[══]\x1b[0m';
+  const ash = '\x1b[2m' + '·'.repeat(burned) + '\x1b[0m';
+  const paper = '━'.repeat(remaining);
+  const ember = ratio >= 1 ? '💨' : '🔥';
+  return '  ' + filter + ash + ember + paper;
+}
+
+function printReport(session, totals) {
+  const total = totals.input_tokens + totals.output_tokens + totals.cache_creation_tokens + totals.cache_read_tokens;
+  const startedAt = session.startedAt ? new Date(session.startedAt).toLocaleString() : 'unknown';
+  const sessionLabel = session.sessionId ? session.sessionId.slice(0, 8) + '...' : 'unknown';
+
+  console.log('');
+  console.log('  \x1b[1m\x1b[33m🔥 smoked — session report\x1b[0m');
+  console.log('  \x1b[2m' + '─'.repeat(40) + '\x1b[0m');
+  console.log('');
+  console.log('  \x1b[2mSession:\x1b[0m  ' + sessionLabel);
+  console.log('  \x1b[2mStarted:\x1b[0m  ' + startedAt);
+
+  if (totals.responses === 0) {
+    console.log('');
+    console.log('  \x1b[2mNo billable usage recorded for this session yet.\x1b[0m');
+    console.log('');
+    return;
+  }
+
+  console.log('  \x1b[2mTurns:\x1b[0m     ' + totals.turns);
+  console.log('  \x1b[2mResponses:\x1b[0m ' + totals.responses);
+  console.log('');
+  console.log('  \x1b[1mTokens\x1b[0m');
+  console.log('  Input:          ' + formatNumber(totals.input_tokens));
+  console.log('  Output:         ' + formatNumber(totals.output_tokens));
+  console.log('  Cache create:   ' + formatNumber(totals.cache_creation_tokens));
+  console.log('  Cache read:     ' + formatNumber(totals.cache_read_tokens));
+  console.log('  \x1b[2m' + '─'.repeat(40) + '\x1b[0m');
+  console.log('  \x1b[1mTotal:            ' + formatNumber(total) + '\x1b[0m');
+  console.log('');
+  console.log('  \x1b[1mEstimated cost:   \x1b[33m' + formatCost(totals.cost_usd) + '\x1b[0m');
+  console.log('  \x1b[2m(what you\'d pay without a subscription)\x1b[0m');
+  console.log('');
+  console.log(renderBurnBar(totals.cost_usd));
+  console.log('  ' + getTagline(totals.cost_usd));
+  console.log('');
+
+  if (totals.unknown_models.size > 0) {
+    console.log('  \x1b[33m⚠  No pricing known for: ' + Array.from(totals.unknown_models).join(', ') + '\x1b[0m');
+    console.log('  \x1b[2mCost above excludes tokens billed to these models.\x1b[0m');
+    console.log('');
+  }
+
+  // Per-model breakdown if multiple models
+  const models = Object.keys(totals.by_model);
+  if (models.length > 1) {
+    console.log('  \x1b[1mBy model\x1b[0m');
+    for (const model of models) {
+      const m = totals.by_model[model];
+      const modelTotal = m.input + m.output + m.cache_create + m.cache_read;
+      console.log('  \x1b[2m' + model + ':\x1b[0m ' + formatNumber(modelTotal));
+    }
+    console.log('');
+  }
+}
+
+// --- Slash-command shortcut for Claude Code -------------------------------
+
+const SHORTCUT_PATH = path.join(CLAUDE_DIR, 'commands', 'smoked.md');
+const SHORTCUT_BODY = `---
+description: Show token usage and estimated cost for the current Claude Code session
+---
+
+Run \`smoked\` via Bash and show the output to the user exactly as-is. If \`smoked\` is not on PATH, tell the user to install it with \`npm install -g smoked\`.
+`;
+
+function installShortcut() {
+  if (!fs.existsSync(CLAUDE_DIR)) {
+    console.error('  ~/.claude does not exist. Is Claude Code installed?');
+    process.exit(1);
+  }
+  if (fs.existsSync(SHORTCUT_PATH)) {
+    console.error('  Shortcut already exists at ' + SHORTCUT_PATH);
+    console.error('  Remove it manually or run `smoked uninstall-shortcut` first.');
+    process.exit(1);
+  }
+  fs.mkdirSync(path.dirname(SHORTCUT_PATH), { recursive: true });
+  fs.writeFileSync(SHORTCUT_PATH, SHORTCUT_BODY);
+  console.log('  ✓ Installed /smoked at ' + SHORTCUT_PATH);
+  console.log('  \x1b[2mRestart Claude Code (or open a new session) for /smoked to appear.\x1b[0m');
+}
+
+function uninstallShortcut() {
+  if (!fs.existsSync(SHORTCUT_PATH)) {
+    console.log('  Nothing to do — no shortcut found at ' + SHORTCUT_PATH);
+    return;
+  }
+  fs.unlinkSync(SHORTCUT_PATH);
+  console.log('  ✓ Removed ' + SHORTCUT_PATH);
+}
+
+function printHelp() {
+  console.log('Usage: smoked [command]');
+  console.log('');
+  console.log('Commands:');
+  console.log('  (no args)            show token usage and cost for the current session');
+  console.log('  install-shortcut     add /smoked slash command to ~/.claude/commands');
+  console.log('  uninstall-shortcut   remove the slash command');
+  console.log('  --help, -h           show this message');
+}
+
+// --- Main ------------------------------------------------------------------
+
+const subcommand = process.argv[2];
+
+if (subcommand === '--help' || subcommand === '-h') {
+  printHelp();
+  process.exit(0);
+}
+
+if (subcommand === 'install-shortcut') {
+  installShortcut();
+  process.exit(0);
+}
+
+if (subcommand === 'uninstall-shortcut') {
+  uninstallShortcut();
+  process.exit(0);
+}
+
+if (subcommand && subcommand !== '') {
+  console.error('  Unknown command: ' + subcommand);
+  console.error('');
+  printHelp();
+  process.exit(1);
+}
+
+const session = findCurrentSession();
+if (!session) {
+  console.error('  No active Claude Code session found.');
+  process.exit(1);
+}
+
+const logFile = findSessionLog(session.sessionId);
+if (!logFile) {
+  console.error('  No log file found for session ' + session.sessionId);
+  process.exit(1);
+}
+
+const totals = parseTokens(logFile);
+printReport(session, totals);
