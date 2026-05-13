@@ -100,6 +100,20 @@ function findSessionLog(sessionId) {
   return null;
 }
 
+function loadAllSessions() {
+  if (!fs.existsSync(SESSIONS_DIR)) return [];
+  return fs.readdirSync(SESSIONS_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, f), 'utf8'));
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
 function parseTokens(logFile) {
   const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n');
 
@@ -301,9 +315,90 @@ function printHelp() {
   console.log('');
   console.log('Commands:');
   console.log('  (no args)            show token usage and cost for the current session');
+  console.log('  --list               list all sessions with their cost');
+  console.log('  --all                cumulative cost across every session');
   console.log('  install-shortcut     add /smoked slash command to ~/.claude/commands');
   console.log('  uninstall-shortcut   remove the slash command');
   console.log('  --help, -h           show this message');
+}
+
+// Compute cost + recency for every session on disk.
+function summarizeAllSessions() {
+  return loadAllSessions()
+    .map(s => {
+      const logFile = findSessionLog(s.sessionId);
+      const totals = logFile ? parseTokens(logFile) : null;
+      return {
+        session: s,
+        cost: totals ? totals.cost_usd : 0,
+        responses: totals ? totals.responses : 0,
+        when: s.updatedAt || s.startedAt || 0,
+      };
+    });
+}
+
+function truncateCwd(cwd, maxLen = 40) {
+  if (!cwd) return '?';
+  const home = os.homedir();
+  let out = cwd.startsWith(home) ? '~' + cwd.slice(home.length) : cwd;
+  if (out.length > maxLen) out = '…' + out.slice(-(maxLen - 1));
+  return out;
+}
+
+function formatDate(ts) {
+  if (!ts) return '       ';
+  const d = new Date(ts);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mn = String(d.getMinutes()).padStart(2, '0');
+  return `${mm}/${dd} ${hh}:${mn}`;
+}
+
+function printList() {
+  const rows = summarizeAllSessions().sort((a, b) => b.cost - a.cost);
+
+  console.log('');
+  console.log('  \x1b[1m\x1b[33m🔥 smoked — all sessions\x1b[0m');
+  console.log('  \x1b[2m' + '─'.repeat(70) + '\x1b[0m');
+  console.log('');
+
+  if (rows.length === 0) {
+    console.log('  No Claude Code sessions found.');
+    console.log('');
+    return;
+  }
+
+  console.log('  \x1b[2mSession   Status  Updated        Cost      cwd\x1b[0m');
+  let total = 0;
+  for (const r of rows) {
+    const id = (r.session.sessionId || '????????').slice(0, 8);
+    const status = (r.session.status || '?').padEnd(6);
+    const when = formatDate(r.when);
+    const cost = formatCost(r.cost).padStart(8);
+    const cwd = truncateCwd(r.session.cwd);
+    console.log(`  ${id}  ${status}  ${when}  \x1b[1m${cost}\x1b[0m  \x1b[2m${cwd}\x1b[0m`);
+    total += r.cost;
+  }
+  console.log('  \x1b[2m' + '─'.repeat(70) + '\x1b[0m');
+  console.log(`  \x1b[1m${rows.length} session${rows.length === 1 ? '' : 's'}, total: \x1b[33m${formatCost(total)}\x1b[0m`);
+  console.log('');
+}
+
+function printAll() {
+  const rows = summarizeAllSessions();
+  const total = rows.reduce((sum, r) => sum + r.cost, 0);
+
+  console.log('');
+  console.log('  \x1b[1m\x1b[33m🔥 smoked — ' + rows.length + ' session' + (rows.length === 1 ? '' : 's') + ', all time\x1b[0m');
+  console.log('  \x1b[2m' + '─'.repeat(40) + '\x1b[0m');
+  console.log('');
+  console.log('  \x1b[1mTotal cost:   \x1b[33m' + formatCost(total) + '\x1b[0m');
+  console.log('  \x1b[2m(what you\'d pay without a subscription)\x1b[0m');
+  console.log('');
+  console.log(renderBurnBar(total));
+  console.log('  ' + getTagline(total));
+  console.log('');
 }
 
 // --- Main ------------------------------------------------------------------
@@ -322,6 +417,16 @@ if (subcommand === 'install-shortcut') {
 
 if (subcommand === 'uninstall-shortcut') {
   uninstallShortcut();
+  process.exit(0);
+}
+
+if (subcommand === '--list') {
+  printList();
+  process.exit(0);
+}
+
+if (subcommand === '--all') {
+  printAll();
   process.exit(0);
 }
 

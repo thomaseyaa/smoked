@@ -64,6 +64,14 @@ Or install as a plugin: `/plugin install thomaseyaa/smoked` → exposes `/smoked
 
 Removal: `smoked uninstall-shortcut` and/or `npm uninstall -g smoked`.
 
+## Other commands
+
+```bash
+smoked --list   # every session, sorted by cost
+smoked --all    # cumulative total across every session
+smoked --help   # everything
+```
+
 ## How it works
 
 When run from a project directory, `smoked` picks the Claude Code session whose `cwd` matches yours. Otherwise it falls back to the busy session, then to the most recently active one.
