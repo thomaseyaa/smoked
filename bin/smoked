@@ -323,11 +323,16 @@ function printHelp() {
 }
 
 // Compute cost + recency for every session on disk.
+// parseTokens is wrapped in try/catch so one corrupt jsonl can't crash the
+// whole listing — that session just shows up with zero cost.
 function summarizeAllSessions() {
   return loadAllSessions()
     .map(s => {
       const logFile = findSessionLog(s.sessionId);
-      const totals = logFile ? parseTokens(logFile) : null;
+      let totals = null;
+      if (logFile) {
+        try { totals = parseTokens(logFile); } catch {}
+      }
       return {
         session: s,
         cost: totals ? totals.cost_usd : 0,
