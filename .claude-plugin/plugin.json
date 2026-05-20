@@ -1,7 +1,7 @@
 {
   "name": "smoked",
   "description": "See how many tokens your AI coding session is burning",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": {
     "name": "Thomas Eyaa"
   },
